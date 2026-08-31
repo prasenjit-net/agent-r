@@ -14,6 +14,8 @@ The implemented MVP includes:
 
 The workspace also includes `agent-mcp`, an optional stdio JSON-RPC MCP client and namespaced tool bridge.
 
+Provider reliability primitives in `agent-llm` support metadata, exponential-backoff retries, and ordered fallback chains.
+
 ## Run
 
 ```sh

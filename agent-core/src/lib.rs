@@ -339,11 +339,34 @@ pub struct CompletionResponse {
     pub usage: TokenUsage,
 }
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error)]
 #[error("provider error: {0}")]
 pub struct ProviderError(pub String);
+
+#[derive(Clone, Debug)]
+pub struct ProviderMetadata {
+    pub model: String,
+    pub context_window_tokens: Option<usize>,
+    pub supports_tools: bool,
+    pub supports_streaming: bool,
+}
+
+impl Default for ProviderMetadata {
+    fn default() -> Self {
+        Self {
+            model: "unknown".into(),
+            context_window_tokens: None,
+            supports_tools: true,
+            supports_streaming: false,
+        }
+    }
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
+    fn metadata(&self) -> ProviderMetadata {
+        ProviderMetadata::default()
+    }
     async fn complete(
         &self,
         request: CompletionRequest,
