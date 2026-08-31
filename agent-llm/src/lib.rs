@@ -270,3 +270,30 @@ impl Provider for FallbackProvider {
         )))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_text_tool_calls_and_usage() {
+        let response = parse_openai_response(json!({
+            "choices": [{"message": {"content": "Checking.", "tool_calls": [{"id":"call_1", "type":"function", "function":{"name":"filesystem.read_file", "arguments":"{\"path\":\"README.md\"}"}}]}}],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 7}
+        })).unwrap();
+        assert_eq!(response.usage.input_tokens, 12);
+        assert_eq!(response.usage.output_tokens, 7);
+        assert!(matches!(&response.content[0], ContentBlock::Text(text) if text == "Checking."));
+        assert!(
+            matches!(&response.content[1], ContentBlock::ToolCall { id, name, arguments } if id == "call_1" && name == "filesystem.read_file" && arguments["path"] == "README.md")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_tool_arguments() {
+        let result = parse_openai_response(
+            json!({"choices":[{"message":{"tool_calls":[{"id":"call_1","function":{"name":"tool","arguments":"not json"}}]}}]}),
+        );
+        assert!(result.is_err());
+    }
+}
