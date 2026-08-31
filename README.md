@@ -12,6 +12,8 @@ The implemented MVP includes:
 - a deterministic `MockProvider` plus an executable demo; and
 - serializable session/memory state, host-provided stores, resumable sessions, and budgeted context compaction.
 
+The workspace also includes `agent-mcp`, an optional stdio JSON-RPC MCP client and namespaced tool bridge.
+
 ## Run
 
 ```sh

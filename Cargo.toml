@@ -1,5 +1,5 @@
 [workspace]
-members = ["agent-core", "agent-llm", "agent-tools", "examples/demo"]
+members = ["agent-core", "agent-llm", "agent-tools", "agent-mcp", "examples/demo"]
 resolver = "2"
 
 [workspace.package]
@@ -12,6 +12,6 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "process", "fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "process", "fs", "io-util"] }
 tokio-util = "0.7"
 uuid = { version = "1", features = ["serde", "v4"] }
