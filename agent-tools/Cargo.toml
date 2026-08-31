@@ -8,9 +8,11 @@ license.workspace = true
 default = ["fs", "shell"]
 fs = []
 shell = []
+http = ["dep:reqwest"]
 
 [dependencies]
 agent-core = { path = "../agent-core" }
 async-trait.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+reqwest = { workspace = true, optional = true }

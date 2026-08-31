@@ -2,6 +2,39 @@
 use agent_core::{Tool, ToolContext, ToolError, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{json, Value};
+
+#[cfg(feature = "http")]
+pub struct HttpGet;
+#[cfg(feature = "http")]
+#[async_trait]
+impl Tool for HttpGet {
+    fn name(&self) -> &str {
+        "http.get"
+    }
+    fn description(&self) -> &str {
+        "Fetch an HTTP(S) URL and return its response body."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type":"object","required":["url"],"properties":{"url":{"type":"string","format":"uri"}}})
+    }
+    async fn run(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let url = args
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("url is required".into()))?;
+        let request = reqwest::get(url);
+        let response = tokio::select! { _ = ctx.cancellation.cancelled() => return Err(ToolError::Cancelled), result = request => result.map_err(|e| ToolError::Execution(e.to_string()))? };
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| ToolError::Execution(e.to_string()))?;
+        Ok(ToolOutput {
+            text,
+            payload: Some(json!({"status": status.as_u16(), "success": status.is_success()})),
+        })
+    }
+}
 use std::path::{Component, Path, PathBuf};
 
 fn safe_path(root: &Path, requested: &str) -> Result<PathBuf, ToolError> {
