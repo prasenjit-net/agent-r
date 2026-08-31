@@ -339,6 +339,16 @@ pub struct CompletionResponse {
     pub usage: TokenUsage,
 }
 
+#[derive(Clone, Debug)]
+pub enum ProviderStreamEvent {
+    TextDelta(String),
+}
+#[derive(Clone, Debug)]
+pub struct CompletionStream {
+    pub events: Vec<ProviderStreamEvent>,
+    pub response: CompletionResponse,
+}
+
 #[derive(Clone, Debug, Error)]
 #[error("provider error: {0}")]
 pub struct ProviderError(pub String);
@@ -371,6 +381,21 @@ pub trait Provider: Send + Sync {
         &self,
         request: CompletionRequest,
     ) -> Result<CompletionResponse, ProviderError>;
+    async fn stream(&self, request: CompletionRequest) -> Result<CompletionStream, ProviderError> {
+        let response = self.complete(request).await?;
+        let events = response
+            .content
+            .iter()
+            .filter_map(|block| {
+                if let ContentBlock::Text(text) = block {
+                    Some(ProviderStreamEvent::TextDelta(text.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Ok(CompletionStream { events, response })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -580,20 +605,20 @@ impl Agent {
             }
             self.emit(AgentEvent::TurnStarted { turn }).await;
             let context = self.context_for(&mut session).await;
-            let response = self
+            let stream = self
                 .provider
-                .complete(CompletionRequest {
+                .stream(CompletionRequest {
                     messages: context,
                     tools: self.registry.definitions(),
                 })
                 .await?;
+            for event in stream.events {
+                let ProviderStreamEvent::TextDelta(text) = event;
+                self.emit(AgentEvent::TextDelta(text)).await;
+            }
+            let response = stream.response;
             usage.input_tokens += response.usage.input_tokens;
             usage.output_tokens += response.usage.output_tokens;
-            for block in &response.content {
-                if let ContentBlock::Text(text) = block {
-                    self.emit(AgentEvent::TextDelta(text.clone())).await;
-                }
-            }
             let tool_calls: Vec<_> = response
                 .content
                 .iter()
