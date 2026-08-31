@@ -454,7 +454,7 @@ let result = agent.run("Check service health and summarize the incident").await?
 println!("{}", result.final_answer);
 ```
 
-Same runtime, different role, different tool set. A coding agent host would register the coding pack instead, point `workspace_root` at a repo, and allow shell execution in its `ToolPolicy`. The capability-bundle presets from section 3 remain a planned convenience layer over this registry API — typed `enable(CapabilityBundle::Ops)`-style constructors that expand to the registrations shown above.
+Same runtime, different role, different tool set. A coding agent host would register the coding pack instead, point `workspace_root` at a repo, and allow shell execution in its `ToolPolicy`. The capability-bundle presets from section 3 are implemented in `agent-tools` as `CapabilityBundle::{Coding, Ops}`, each with `.register(registry)` and `.allow_policy()` — see `examples/demo` (Coding) and `examples/ops-cli` (Ops) for the same runtime configured as two different agents through this API.
 
 ---
 
@@ -532,10 +532,17 @@ An agent loop is painful to test against live APIs, so testability is designed i
 - namespacing and policy application for external tools
 
 ### Phase 5: Reliability and breadth
-- additional providers, provider fallback
-- retry logic and rate limiting
-- streaming hardening and richer usage reporting
-- remaining tool packs and capability profiles
+- Anthropic provider alongside the OpenAI-compatible one, both with real
+  incremental SSE streaming (`CompletionStream` is a live event stream, not a
+  replayed one-shot); `RetryingProvider` only retries errors marked
+  `retryable` (429/5xx), and both it and `FallbackProvider` preserve
+  streaming end-to-end rather than degrading to one-shot
+- independent tool calls within a turn execute concurrently
+- `CapabilityBundle` presets (Coding, Ops) shipped in `agent-tools`
+- configurable secret redaction (`AgentConfig.redact`) applied to tool output
+  and error events
+- rate limiting: still open
+- remaining tool packs (`write_file`, `search_files`): still open
 
 ### First milestone (MVP = Phases 1–2 plus a demo)
 
