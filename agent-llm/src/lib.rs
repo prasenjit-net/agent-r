@@ -23,6 +23,36 @@ pub struct OpenAiCompatibleProvider {
     api_key: String,
     model: String,
 }
+
+/// Local Ollama preset using its OpenAI-compatible `/v1` endpoint.
+pub struct OllamaProvider(OpenAiCompatibleProvider);
+impl OllamaProvider {
+    pub fn new(model: impl Into<String>) -> Self {
+        Self(OpenAiCompatibleProvider::with_base_url(
+            "http://localhost:11434/v1",
+            "ollama",
+            model,
+        ))
+    }
+}
+#[async_trait]
+impl Provider for OllamaProvider {
+    fn metadata(&self) -> ProviderMetadata {
+        self.0.metadata()
+    }
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse, ProviderError> {
+        self.0.complete(request).await
+    }
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<agent_core::CompletionStream, ProviderError> {
+        self.0.stream(request).await
+    }
+}
 impl OpenAiCompatibleProvider {
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::with_base_url("https://api.openai.com/v1", api_key, model)
