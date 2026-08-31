@@ -73,8 +73,11 @@ impl McpClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            // Otherwise a dropped client leaks the server process.
+            .kill_on_drop(true)
             .spawn()
             .map_err(McpError::Start)?;
+        tracing::debug!(command = %config.command, "spawned MCP server");
         let stdin = child
             .stdin
             .take()
@@ -100,6 +103,7 @@ impl McpClient {
         let result = self.request("tools/list", json!({})).await?;
         let listed: ToolList = serde_json::from_value(result)
             .map_err(|error| McpError::Protocol(format!("invalid tools/list result: {error}")))?;
+        tracing::debug!(count = listed.tools.len(), "discovered MCP tools");
         Ok(listed
             .tools
             .into_iter()

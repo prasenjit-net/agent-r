@@ -1,13 +1,16 @@
 [package]
 name = "agent-mcp"
+description = "Model Context Protocol (stdio) client and tool bridge for agent-core."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
-agent-core = { path = "../agent-core" }
+agent-core.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true

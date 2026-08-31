@@ -1,9 +1,6 @@
-use agent_core::{
-    AgentBuilder, AgentProfile, CompletionResponse, ContentBlock, ToolPermission, ToolPolicy,
-    ToolRegistry, ToolSource,
-};
+use agent_core::{AgentBuilder, AgentProfile, CompletionResponse, ContentBlock, ToolRegistry};
 use agent_llm::MockProvider;
-use agent_tools::{ListDir, ReadFile};
+use agent_tools::CapabilityBundle;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,16 +20,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             usage: Default::default(),
         },
     ];
-    let registry = ToolRegistry::new()
-        .register(ListDir, ToolSource::Builtin)?
-        .register(ReadFile, ToolSource::Builtin)?;
-    let mut policy = ToolPolicy::default();
-    policy
-        .per_tool
-        .insert("filesystem.list_dir".into(), ToolPermission::Allow);
-    policy
-        .per_tool
-        .insert("filesystem.read_file".into(), ToolPermission::Allow);
+    // The Coding bundle presets a matching tool registry and allow policy;
+    // see examples/ops-cli for the same runtime configured as a different
+    // kind of agent via CapabilityBundle::Ops.
+    let registry = CapabilityBundle::Coding.register(ToolRegistry::new())?;
     let (agent, mut events) = AgentBuilder::new()
         .profile(AgentProfile {
             name: "demo-agent".into(),
@@ -41,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .provider(MockProvider::scripted(responses))
         .tools(registry)
-        .tool_policy(policy)
+        .tool_policy(CapabilityBundle::Coding.allow_policy())
         .build()?;
     let printer = tokio::spawn(async move {
         while let Some(event) = events.recv().await {

@@ -1,12 +1,17 @@
 [package]
 name = "agent-llm"
+description = "LLM provider implementations (OpenAI-compatible, Anthropic, Ollama) plus retry and fallback wrappers for agent-core."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
-agent-core = { path = "../agent-core" }
+agent-core.workspace = true
+async-stream.workspace = true
 async-trait.workspace = true
+futures.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tracing.workspace = true

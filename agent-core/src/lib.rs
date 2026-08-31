@@ -1,10 +1,12 @@
 //! Provider-neutral, embeddable agent runtime.
 
 use async_trait::async_trait;
+use futures::{stream, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -195,6 +197,40 @@ impl ToolPolicy {
     }
 }
 
+/// Masks configured secret literals (e.g. provider API keys) out of tool
+/// output and error text before it is stored in the session or emitted as an
+/// event. `Debug` is hand-written so accidentally printing `AgentConfig`
+/// cannot leak the very secrets this exists to protect.
+#[derive(Clone, Default)]
+pub struct SecretRedactor {
+    secrets: Vec<String>,
+}
+
+impl std::fmt::Debug for SecretRedactor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SecretRedactor({} pattern(s))", self.secrets.len())
+    }
+}
+
+impl SecretRedactor {
+    pub fn new(secrets: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            secrets: secrets
+                .into_iter()
+                .map(Into::into)
+                .filter(|secret| !secret.is_empty())
+                .collect(),
+        }
+    }
+    pub fn redact(&self, text: &str) -> String {
+        let mut redacted = text.to_owned();
+        for secret in &self.secrets {
+            redacted = redacted.replace(secret.as_str(), "[REDACTED]");
+        }
+        redacted
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
     pub max_turns: usize,
@@ -202,6 +238,7 @@ pub struct AgentConfig {
     pub timeout: Duration,
     pub workspace_root: std::path::PathBuf,
     pub context_budget: ContextBudget,
+    pub redact: SecretRedactor,
 }
 
 impl Default for AgentConfig {
@@ -212,6 +249,7 @@ impl Default for AgentConfig {
             timeout: Duration::from_secs(60),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| ".".into()),
             context_budget: ContextBudget::default(),
+            redact: SecretRedactor::default(),
         }
     }
 }
@@ -221,6 +259,10 @@ impl Default for AgentConfig {
 pub struct ContextBudget {
     pub max_estimated_tokens: usize,
     pub summary_trigger_tokens: usize,
+    /// Caps how large the compacted summary itself can grow. Without this,
+    /// a long session's summary accumulates forever since it is never
+    /// re-summarized; past the cap, the oldest summary entries are dropped.
+    pub max_summary_tokens: usize,
 }
 
 impl Default for ContextBudget {
@@ -228,6 +270,7 @@ impl Default for ContextBudget {
         Self {
             max_estimated_tokens: 12_000,
             summary_trigger_tokens: 512,
+            max_summary_tokens: 3_000,
         }
     }
 }
@@ -339,19 +382,94 @@ pub struct CompletionResponse {
     pub usage: TokenUsage,
 }
 
+/// Incremental provider output. `Usage` carries a delta to add to a running
+/// total, not a cumulative snapshot: providers report it differently (OpenAI
+/// sends one final usage chunk; Anthropic splits input/output tokens across
+/// `message_start` and `message_delta`), and deltas compose correctly for both.
 #[derive(Clone, Debug)]
 pub enum ProviderStreamEvent {
     TextDelta(String),
-}
-#[derive(Clone, Debug)]
-pub struct CompletionStream {
-    pub events: Vec<ProviderStreamEvent>,
-    pub response: CompletionResponse,
+    ToolCallStarted {
+        id: ToolCallId,
+        name: String,
+    },
+    ToolCallArgumentsDelta {
+        id: ToolCallId,
+        partial_json: String,
+    },
+    ToolCallCompleted {
+        id: ToolCallId,
+    },
+    Usage(TokenUsage),
 }
 
+pub type CompletionStream =
+    Pin<Box<dyn Stream<Item = Result<ProviderStreamEvent, ProviderError>> + Send>>;
+
+/// Replays an already-complete response as a single-shot stream, for
+/// providers that only implement `complete`.
+pub fn one_shot_stream(response: CompletionResponse) -> CompletionStream {
+    let mut events = Vec::new();
+    for block in &response.content {
+        match block {
+            ContentBlock::Text(text) => events.push(ProviderStreamEvent::TextDelta(text.clone())),
+            ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                events.push(ProviderStreamEvent::ToolCallStarted {
+                    id: id.clone(),
+                    name: name.clone(),
+                });
+                events.push(ProviderStreamEvent::ToolCallArgumentsDelta {
+                    id: id.clone(),
+                    partial_json: arguments.to_string(),
+                });
+                events.push(ProviderStreamEvent::ToolCallCompleted { id: id.clone() });
+            }
+        }
+    }
+    events.push(ProviderStreamEvent::Usage(response.usage));
+    Box::pin(stream::iter(events.into_iter().map(Ok)))
+}
+
+/// A provider failure. `retryable` distinguishes transient problems (rate
+/// limits, timeouts, 5xx responses) from permanent ones (bad request, auth
+/// failure) so callers like `RetryingProvider` don't retry what can never
+/// succeed.
 #[derive(Clone, Debug, Error)]
-#[error("provider error: {0}")]
-pub struct ProviderError(pub String);
+#[error("provider error: {message}")]
+pub struct ProviderError {
+    pub message: String,
+    pub status: Option<u16>,
+    pub retryable: bool,
+}
+
+impl ProviderError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            status: None,
+            retryable: false,
+        }
+    }
+    pub fn retryable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            status: None,
+            retryable: true,
+        }
+    }
+    /// Classifies retryability from an HTTP status: 429 and 5xx are transient.
+    pub fn from_status(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            status: Some(status),
+            retryable: status == 429 || status >= 500,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ProviderMetadata {
@@ -381,20 +499,10 @@ pub trait Provider: Send + Sync {
         &self,
         request: CompletionRequest,
     ) -> Result<CompletionResponse, ProviderError>;
+    /// Providers that can stream incrementally should override this; the
+    /// default falls back to `complete` and replays the result as one shot.
     async fn stream(&self, request: CompletionRequest) -> Result<CompletionStream, ProviderError> {
-        let response = self.complete(request).await?;
-        let events = response
-            .content
-            .iter()
-            .filter_map(|block| {
-                if let ContentBlock::Text(text) = block {
-                    Some(ProviderStreamEvent::TextDelta(text.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        Ok(CompletionStream { events, response })
+        Ok(one_shot_stream(self.complete(request).await?))
     }
 }
 
@@ -519,7 +627,7 @@ impl AgentBuilder {
                 registry: self.registry,
                 provider: self
                     .provider
-                    .ok_or_else(|| ProviderError("provider is required".into()))?,
+                    .ok_or_else(|| ProviderError::new("provider is required"))?,
                 approval: self.approval,
                 events,
                 session_store: self.session_store,
@@ -585,6 +693,7 @@ impl Agent {
         mut session: SessionState,
         cancellation: CancellationToken,
     ) -> Result<AgentResult, AgentError> {
+        tracing::info!(session_id = %session.id, "agent run starting");
         let result = match tokio::time::timeout(
             self.config.timeout,
             self.run_session_inner(&mut session, cancellation),
@@ -595,8 +704,9 @@ impl Agent {
             Err(_) => Err(AgentError::TimedOut),
         };
         if let Err(error) = &result {
+            tracing::warn!(session_id = %session.id, error = %error, "agent run failed");
             self.emit(AgentEvent::Failed {
-                error: error.to_string(),
+                error: self.config.redact.redact(&error.to_string()),
             });
             // An interrupted turn may leave tool calls without results, which
             // strict providers reject on resume.
@@ -626,53 +736,95 @@ impl Agent {
                 return Err(AgentError::Cancelled);
             }
             self.emit(AgentEvent::TurnStarted { turn });
+            tracing::debug!(turn, "turn started");
             let context = self.context_for(session);
-            let stream = self
-                .provider
-                .stream(CompletionRequest {
+            let mut stream = tokio::select! {
+                _ = cancellation.cancelled() => return Err(AgentError::Cancelled),
+                result = self.provider.stream(CompletionRequest {
                     messages: context,
                     tools: self.registry.definitions(),
-                })
-                .await?;
-            for event in stream.events {
-                let ProviderStreamEvent::TextDelta(text) = event;
-                self.emit(AgentEvent::TextDelta(text));
-            }
-            let response = stream.response;
-            usage.input_tokens += response.usage.input_tokens;
-            usage.output_tokens += response.usage.output_tokens;
-            let tool_calls: Vec<_> = response
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::ToolCall {
-                        id,
-                        name,
-                        arguments,
-                    } => Some(ToolCall {
-                        id: id.clone(),
-                        name: name.clone(),
-                        arguments: arguments.clone(),
-                    }),
-                    _ => None,
-                })
-                .collect();
-            session.messages.push(Message::Assistant {
-                content: response.content.clone(),
-            });
-            if tool_calls.is_empty() {
-                let final_answer = response
-                    .content
-                    .iter()
-                    .filter_map(|b| {
-                        if let ContentBlock::Text(t) = b {
-                            Some(t.as_str())
-                        } else {
-                            None
+                }) => result?,
+            };
+
+            let mut text = String::new();
+            // Preserves the order tool calls first appeared in the stream.
+            let mut tool_call_order: Vec<ToolCallId> = Vec::new();
+            let mut tool_call_names: HashMap<ToolCallId, String> = HashMap::new();
+            let mut tool_call_args: HashMap<ToolCallId, String> = HashMap::new();
+            loop {
+                let next = tokio::select! {
+                    _ = cancellation.cancelled() => return Err(AgentError::Cancelled),
+                    next = stream.next() => next,
+                };
+                let Some(event) = next else { break };
+                match event? {
+                    ProviderStreamEvent::TextDelta(delta) => {
+                        self.emit(AgentEvent::TextDelta(delta.clone()));
+                        text.push_str(&delta);
+                    }
+                    ProviderStreamEvent::ToolCallStarted { id, name } => {
+                        if !tool_call_names.contains_key(&id) {
+                            tool_call_order.push(id.clone());
                         }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
+                        tool_call_names.insert(id.clone(), name);
+                        tool_call_args.entry(id).or_default();
+                    }
+                    ProviderStreamEvent::ToolCallArgumentsDelta { id, partial_json } => {
+                        tool_call_args
+                            .entry(id)
+                            .or_default()
+                            .push_str(&partial_json);
+                    }
+                    ProviderStreamEvent::ToolCallCompleted { .. } => {}
+                    ProviderStreamEvent::Usage(delta) => {
+                        usage.input_tokens += delta.input_tokens;
+                        usage.output_tokens += delta.output_tokens;
+                    }
+                }
+            }
+
+            let mut content = Vec::new();
+            if !text.is_empty() {
+                content.push(ContentBlock::Text(text));
+            }
+            let mut tool_calls = Vec::new();
+            for id in tool_call_order {
+                let name = tool_call_names.remove(&id).unwrap_or_default();
+                let raw = tool_call_args.remove(&id).unwrap_or_default();
+                let arguments = if raw.trim().is_empty() {
+                    serde_json::json!({})
+                } else {
+                    serde_json::from_str(&raw).map_err(|error| {
+                        ProviderError::new(format!(
+                            "invalid arguments for tool call '{name}': {error}"
+                        ))
+                    })?
+                };
+                content.push(ContentBlock::ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                });
+                tool_calls.push(ToolCall {
+                    id,
+                    name,
+                    arguments,
+                });
+            }
+            let final_answer = content
+                .iter()
+                .filter_map(|block| {
+                    if let ContentBlock::Text(text) = block {
+                        Some(text.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            session.messages.push(Message::Assistant { content });
+
+            if tool_calls.is_empty() {
                 let result = AgentResult {
                     final_answer,
                     messages: session.messages.clone(),
@@ -687,74 +839,117 @@ impl Agent {
                 });
                 return Ok(result);
             }
-            for mut call in tool_calls {
-                calls += 1;
-                if calls > self.config.max_tool_calls {
-                    return Err(AgentError::ToolBudgetExceeded);
-                }
-                self.emit(AgentEvent::ToolCallRequested { call: call.clone() });
-                match self.policy.permission(&call.name) {
-                    // Recoverable problems (denied, unknown, invalid, failed
-                    // calls) are fed back to the model instead of ending the
-                    // run, so it can adjust course.
-                    ToolPermission::Deny => {
-                        let output = ToolOutput {
-                            text: format!("Denied: tool '{}' is not permitted by policy", call.name),
-                            payload: None,
-                        };
-                        self.push_tool_result(session, call.id, output);
-                        continue;
-                    }
-                    ToolPermission::RequireApproval => match self.approval.review(&call).await {
-                        Approval::Allow => {}
-                        Approval::Modify { arguments } => call.arguments = arguments,
-                        Approval::Deny { reason } => {
-                            let output = ToolOutput {
-                                text: format!("Denied: {reason}"),
-                                payload: None,
-                            };
-                            self.push_tool_result(session, call.id, output);
-                            continue;
-                        }
-                    },
-                    ToolPermission::Allow => {}
-                }
-                let Some(tool) = self.registry.get(&call.name) else {
-                    let output = ToolOutput {
-                        text: format!("Error: unknown tool '{}'", call.name),
-                        payload: None,
-                    };
-                    self.push_tool_result(session, call.id, output);
-                    continue;
-                };
-                if let Err(reason) = validate_arguments(&tool.parameters(), &call.arguments) {
-                    let output = ToolOutput {
-                        text: format!("Invalid arguments: {reason}"),
-                        payload: None,
-                    };
-                    self.push_tool_result(session, call.id, output);
-                    continue;
-                }
-                let context = ToolContext {
-                    session_id: session.id,
-                    workspace_root: self.config.workspace_root.clone(),
-                    cancellation: cancellation.clone(),
-                };
-                let output = match tool.run(call.arguments, &context).await {
-                    Ok(output) => output,
-                    Err(ToolError::Cancelled) => return Err(AgentError::Cancelled),
-                    Err(error) => ToolOutput {
-                        text: format!("Error: {error}"),
-                        payload: None,
-                    },
-                };
-                self.push_tool_result(session, call.id, output);
-            }
+
+            self.run_tool_calls(session, tool_calls, &cancellation, &mut calls)
+                .await?;
             self.emit(AgentEvent::TurnCompleted {
                 usage: usage.clone(),
             });
         }
         Err(AgentError::TurnBudgetExceeded)
+    }
+    /// Resolves permission and approval for each call sequentially (an
+    /// approval hook reviews one call at a time), then runs the approved
+    /// calls concurrently, and finally records their results in the original
+    /// order so the transcript stays deterministic regardless of which
+    /// finished first.
+    async fn run_tool_calls(
+        &self,
+        session: &mut SessionState,
+        tool_calls: Vec<ToolCall>,
+        cancellation: &CancellationToken,
+        calls: &mut usize,
+    ) -> Result<(), AgentError> {
+        let mut to_run: Vec<ToolCall> = Vec::new();
+        for mut call in tool_calls {
+            *calls += 1;
+            if *calls > self.config.max_tool_calls {
+                return Err(AgentError::ToolBudgetExceeded);
+            }
+            self.emit(AgentEvent::ToolCallRequested { call: call.clone() });
+            match self.policy.permission(&call.name) {
+                // Recoverable problems (denied, unknown, invalid) are fed
+                // back to the model instead of ending the run, so it can
+                // adjust course.
+                ToolPermission::Deny => {
+                    let output = ToolOutput {
+                        text: format!("Denied: tool '{}' is not permitted by policy", call.name),
+                        payload: None,
+                    };
+                    self.push_tool_result(session, call.id, output);
+                    continue;
+                }
+                ToolPermission::RequireApproval => match self.approval.review(&call).await {
+                    Approval::Allow => {}
+                    Approval::Modify { arguments } => call.arguments = arguments,
+                    Approval::Deny { reason } => {
+                        let output = ToolOutput {
+                            text: format!("Denied: {reason}"),
+                            payload: None,
+                        };
+                        self.push_tool_result(session, call.id, output);
+                        continue;
+                    }
+                },
+                ToolPermission::Allow => {}
+            }
+            let Some(tool) = self.registry.get(&call.name) else {
+                let output = ToolOutput {
+                    text: format!("Error: unknown tool '{}'", call.name),
+                    payload: None,
+                };
+                self.push_tool_result(session, call.id, output);
+                continue;
+            };
+            if let Err(reason) = validate_arguments(&tool.parameters(), &call.arguments) {
+                let output = ToolOutput {
+                    text: format!("Invalid arguments: {reason}"),
+                    payload: None,
+                };
+                self.push_tool_result(session, call.id, output);
+                continue;
+            }
+            to_run.push(call);
+        }
+
+        if to_run.is_empty() {
+            return Ok(());
+        }
+
+        let context = ToolContext {
+            session_id: session.id,
+            workspace_root: self.config.workspace_root.clone(),
+            cancellation: cancellation.clone(),
+        };
+        let executions: Vec<_> = to_run
+            .iter()
+            .map(|call| {
+                tracing::debug!(
+                    tool = call.name.as_str(),
+                    call_id = call.id.as_str(),
+                    "running tool"
+                );
+                let tool = self
+                    .registry
+                    .get(&call.name)
+                    .expect("presence validated above");
+                tool.run(call.arguments.clone(), &context)
+            })
+            .collect();
+        let outputs = futures::future::join_all(executions).await;
+
+        for (call, outcome) in to_run.into_iter().zip(outputs) {
+            let output = match outcome {
+                Ok(output) => output,
+                Err(ToolError::Cancelled) => return Err(AgentError::Cancelled),
+                Err(error) => ToolOutput {
+                    text: format!("Error: {error}"),
+                    payload: None,
+                },
+            };
+            self.push_tool_result(session, call.id, output);
+        }
+        Ok(())
     }
     /// Assembles the model context, evicting and summarizing older messages
     /// when the estimated size exceeds the budget. Eviction is persisted to the
@@ -779,12 +974,14 @@ impl Agent {
                 session.memory.summary = Some(compact_messages(
                     session.memory.summary.as_deref(),
                     &evicted,
+                    budget.max_summary_tokens,
                 ));
                 // The grown summary may put the context back over budget, so
                 // loop and evict further if candidates remain.
             }
         }
         if evicted_total > 0 {
+            tracing::debug!(evicted = evicted_total, "context compacted");
             self.emit(AgentEvent::ContextCompacted {
                 evicted_messages: evicted_total,
             });
@@ -805,12 +1002,23 @@ impl Agent {
     fn emit(&self, event: AgentEvent) {
         let _ = self.events.try_send(event);
     }
-    fn push_tool_result(&self, session: &mut SessionState, call_id: ToolCallId, output: ToolOutput) {
+    fn push_tool_result(
+        &self,
+        session: &mut SessionState,
+        call_id: ToolCallId,
+        output: ToolOutput,
+    ) {
+        let output = ToolOutput {
+            text: self.config.redact.redact(&output.text),
+            payload: output.payload,
+        };
         self.emit(AgentEvent::ToolCallFinished {
             call_id: call_id.clone(),
             output: output.clone(),
         });
-        session.messages.push(Message::ToolResult { call_id, output });
+        session
+            .messages
+            .push(Message::ToolResult { call_id, output });
     }
 }
 
@@ -824,9 +1032,10 @@ fn evictable_index(messages: &[Message]) -> Option<usize> {
         .iter()
         .position(|message| matches!(message, Message::ToolResult { .. }))
         .or_else(|| {
-            messages.iter().enumerate().find_map(|(index, _)| {
-                (index != 0 && Some(index) != current_user).then_some(index)
-            })
+            messages
+                .iter()
+                .enumerate()
+                .find_map(|(index, _)| (index != 0 && Some(index) != current_user).then_some(index))
         })
 }
 
@@ -928,14 +1137,27 @@ fn estimated_tokens(messages: &[Message]) -> usize {
         .sum()
 }
 
-fn compact_messages(existing: Option<&str>, messages: &[Message]) -> String {
-    let mut entries = existing.map(str::to_owned).into_iter().collect::<Vec<_>>();
-    entries.extend(messages.iter().map(|message| {
+/// Folds newly evicted messages into the existing summary, one bullet line
+/// per message. The summary is never re-summarized (there is no LLM call
+/// here), so it is instead capped by dropping its oldest lines once it grows
+/// past `max_tokens` — otherwise a long session's summary would grow forever.
+fn compact_messages(existing: Option<&str>, messages: &[Message], max_tokens: usize) -> String {
+    let mut lines: Vec<String> = existing
+        .map(|summary| summary.lines().map(str::to_owned).collect())
+        .unwrap_or_default();
+    lines.extend(messages.iter().map(|message| {
         let serialized =
             serde_json::to_string(message).unwrap_or_else(|_| "[unserializable message]".into());
         format!("- {}", serialized.chars().take(400).collect::<String>())
     }));
-    entries.join("\n")
+    while lines.len() > 1 && estimated_line_tokens(&lines) > max_tokens {
+        lines.remove(0);
+    }
+    lines.join("\n")
+}
+
+fn estimated_line_tokens(lines: &[String]) -> usize {
+    lines.iter().map(|line| line.len().div_ceil(4)).sum()
 }
 
 #[cfg(test)]
@@ -1047,6 +1269,7 @@ mod tests {
             context_budget: ContextBudget {
                 max_estimated_tokens: 40,
                 summary_trigger_tokens: 1,
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -1086,6 +1309,7 @@ mod tests {
             context_budget: ContextBudget {
                 max_estimated_tokens: 40,
                 summary_trigger_tokens: 1,
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -1232,5 +1456,197 @@ mod tests {
         let error = agent.run("task").await.unwrap_err();
         assert!(matches!(error, AgentError::TimedOut));
         assert_eq!(store.sessions.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn summary_growth_is_capped_across_many_evictions() {
+        let config = AgentConfig {
+            context_budget: ContextBudget {
+                max_estimated_tokens: 40,
+                summary_trigger_tokens: 1,
+                max_summary_tokens: 50,
+            },
+            ..Default::default()
+        };
+        let (agent, _) = AgentBuilder::new()
+            .config(config)
+            .provider(ScriptedProvider {
+                responses: std::sync::Mutex::new(vec![]),
+            })
+            .build()
+            .unwrap();
+        let mut session = SessionState::new("system".into(), "task".into());
+        // Twenty evictions would grow the summary to ~2000 estimated tokens
+        // if it were never capped.
+        for i in 0..20 {
+            session.messages.push(Message::ToolResult {
+                call_id: format!("call-{i}"),
+                output: ToolOutput {
+                    text: "x".repeat(200),
+                    payload: None,
+                },
+            });
+            agent.context_for(&mut session);
+        }
+        let summary_tokens = session.memory.summary.as_deref().unwrap().len().div_ceil(4);
+        assert!(
+            summary_tokens < 300,
+            "summary grew unbounded: {summary_tokens} estimated tokens"
+        );
+    }
+
+    struct SleepTool;
+    #[async_trait]
+    impl Tool for SleepTool {
+        fn name(&self) -> &str {
+            "sleep"
+        }
+        fn description(&self) -> &str {
+            "sleeps briefly"
+        }
+        fn parameters(&self) -> Value {
+            Value::Null
+        }
+        async fn run(&self, _: Value, _: &ToolContext) -> Result<ToolOutput, ToolError> {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            Ok(ToolOutput {
+                text: "slept".into(),
+                payload: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn independent_tool_calls_in_one_turn_run_concurrently() {
+        let provider = ScriptedProvider {
+            responses: std::sync::Mutex::new(vec![
+                CompletionResponse {
+                    content: vec![
+                        ContentBlock::ToolCall {
+                            id: "a".into(),
+                            name: "sleep".into(),
+                            arguments: serde_json::json!({}),
+                        },
+                        ContentBlock::ToolCall {
+                            id: "b".into(),
+                            name: "sleep".into(),
+                            arguments: serde_json::json!({}),
+                        },
+                    ],
+                    usage: TokenUsage::default(),
+                },
+                CompletionResponse {
+                    content: vec![ContentBlock::Text("done".into())],
+                    usage: TokenUsage::default(),
+                },
+            ]),
+        };
+        let registry = ToolRegistry::new()
+            .register(SleepTool, ToolSource::Custom)
+            .unwrap();
+        let mut policy = ToolPolicy::default();
+        policy
+            .per_tool
+            .insert("sleep".into(), ToolPermission::Allow);
+        let (agent, _) = AgentBuilder::new()
+            .provider(provider)
+            .tools(registry)
+            .tool_policy(policy)
+            .build()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let result = agent.run("go").await.unwrap();
+        // Two 60ms calls run sequentially take >=120ms; concurrently, well under it.
+        assert!(
+            started.elapsed() < Duration::from_millis(110),
+            "tool calls ran sequentially instead of concurrently: {:?}",
+            started.elapsed()
+        );
+        let order: Vec<_> = result
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::ToolResult { call_id, .. } => Some(call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn tool_output_secrets_are_redacted_before_storage() {
+        let provider = ScriptedProvider {
+            responses: std::sync::Mutex::new(vec![
+                CompletionResponse {
+                    content: vec![ContentBlock::ToolCall {
+                        id: "1".into(),
+                        name: "echo".into(),
+                        arguments: serde_json::json!({"value": "token sk-secret123 leaked"}),
+                    }],
+                    usage: TokenUsage::default(),
+                },
+                CompletionResponse {
+                    content: vec![ContentBlock::Text("done".into())],
+                    usage: TokenUsage::default(),
+                },
+            ]),
+        };
+        let registry = ToolRegistry::new()
+            .register(Echo, ToolSource::Custom)
+            .unwrap();
+        let mut policy = ToolPolicy::default();
+        policy.per_tool.insert("echo".into(), ToolPermission::Allow);
+        let (agent, _) = AgentBuilder::new()
+            .config(AgentConfig {
+                redact: SecretRedactor::new(["sk-secret123"]),
+                ..Default::default()
+            })
+            .provider(provider)
+            .tools(registry)
+            .tool_policy(policy)
+            .build()
+            .unwrap();
+        let result = agent.run("go").await.unwrap();
+        assert!(result.messages.iter().any(|message| matches!(
+            message,
+            Message::ToolResult { output, .. }
+                if output.text.contains("[REDACTED]") && !output.text.contains("sk-secret123")
+        )));
+    }
+
+    struct HangingProvider;
+    #[async_trait]
+    impl Provider for HangingProvider {
+        async fn complete(
+            &self,
+            _: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_an_in_flight_provider_call() {
+        let (agent, _) = AgentBuilder::new()
+            .provider(HangingProvider)
+            .build()
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let token = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            token.cancel();
+        });
+        let started = std::time::Instant::now();
+        let error = agent
+            .run_with_cancellation("go", cancellation)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AgentError::Cancelled));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "cancellation did not interrupt the in-flight call promptly: {:?}",
+            started.elapsed()
+        );
     }
 }
