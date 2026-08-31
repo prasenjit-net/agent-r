@@ -4,7 +4,7 @@
 //! the transport used by many local MCP servers. The core runtime has no MCP
 //! dependency; callers explicitly discover and bridge only the servers needed.
 
-use std::{process::Stdio, sync::Arc};
+use std::{collections::HashMap, process::Stdio, sync::Arc};
 
 use agent_core::{Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolSource};
 use async_trait::async_trait;
@@ -55,6 +55,8 @@ impl StdioMcpConfig {
 pub struct McpClient {
     transport: Arc<StdioTransport>,
     next_id: Mutex<u64>,
+    /// Replies read off the wire for requests other than the reader's own.
+    pending: Mutex<HashMap<u64, JsonRpcResponse>>,
 }
 
 struct StdioTransport {
@@ -88,6 +90,7 @@ impl McpClient {
                 stdout: Mutex::new(BufReader::new(stdout).lines()),
             }),
             next_id: Mutex::new(1),
+            pending: Mutex::new(HashMap::new()),
         });
         client.initialize().await?;
         Ok(client)
@@ -137,24 +140,32 @@ impl McpClient {
         };
         self.write(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
             .await?;
-        let mut stdout = self.transport.stdout.lock().await;
-        while let Some(line) = stdout.next_line().await.map_err(McpError::Transport)? {
+        loop {
+            if let Some(response) = self.pending.lock().await.remove(&id) {
+                return resolve(response);
+            }
+            let mut stdout = self.transport.stdout.lock().await;
+            // Another caller may have buffered our reply while we waited for
+            // the reader lock.
+            if let Some(response) = self.pending.lock().await.remove(&id) {
+                return resolve(response);
+            }
+            let Some(line) = stdout.next_line().await.map_err(McpError::Transport)? else {
+                return Err(McpError::Closed);
+            };
             let response: JsonRpcResponse = serde_json::from_str(&line)
                 .map_err(|error| McpError::Protocol(format!("invalid JSON-RPC line: {error}")))?;
-            if response.id != Some(id) {
-                continue;
+            match response.id {
+                Some(response_id) if response_id == id => return resolve(response),
+                // A reply to a different in-flight request is buffered for its
+                // caller instead of being dropped.
+                Some(response_id) => {
+                    self.pending.lock().await.insert(response_id, response);
+                }
+                // Server notifications carry no id and are ignored.
+                None => {}
             }
-            if let Some(error) = response.error {
-                return Err(McpError::Remote {
-                    code: error.code,
-                    message: error.message,
-                });
-            }
-            return response
-                .result
-                .ok_or_else(|| McpError::Protocol("response had neither result nor error".into()));
         }
-        Err(McpError::Closed)
     }
 
     async fn write(&self, payload: Value) -> Result<(), McpError> {
@@ -184,6 +195,18 @@ struct JsonRpcResponse {
     id: Option<u64>,
     result: Option<Value>,
     error: Option<JsonRpcError>,
+}
+
+fn resolve(response: JsonRpcResponse) -> Result<Value, McpError> {
+    if let Some(error) = response.error {
+        return Err(McpError::Remote {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    response
+        .result
+        .ok_or_else(|| McpError::Protocol("response had neither result nor error".into()))
 }
 #[derive(Deserialize)]
 struct JsonRpcError {

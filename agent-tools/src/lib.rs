@@ -37,7 +37,7 @@ impl Tool for HttpGet {
 }
 use std::path::{Component, Path, PathBuf};
 
-fn safe_path(root: &Path, requested: &str) -> Result<PathBuf, ToolError> {
+async fn safe_path(root: &Path, requested: &str) -> Result<PathBuf, ToolError> {
     let path = Path::new(requested);
     if path.is_absolute()
         || path
@@ -48,7 +48,20 @@ fn safe_path(root: &Path, requested: &str) -> Result<PathBuf, ToolError> {
             "path must be relative and must not escape the workspace".into(),
         ));
     }
-    Ok(root.join(path))
+    let root = tokio::fs::canonicalize(root)
+        .await
+        .map_err(|e| ToolError::Execution(e.to_string()))?;
+    // Canonicalization resolves symlinks, so a link inside the workspace that
+    // points outside it cannot escape confinement.
+    let resolved = tokio::fs::canonicalize(root.join(path))
+        .await
+        .map_err(|e| ToolError::Execution(e.to_string()))?;
+    if !resolved.starts_with(&root) {
+        return Err(ToolError::InvalidArguments(
+            "path must be relative and must not escape the workspace".into(),
+        ));
+    }
+    Ok(resolved)
 }
 
 #[cfg(feature = "fs")]
@@ -70,7 +83,7 @@ impl Tool for ReadFile {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidArguments("path is required".into()))?;
-        let contents = tokio::fs::read_to_string(safe_path(&ctx.workspace_root, path)?)
+        let contents = tokio::fs::read_to_string(safe_path(&ctx.workspace_root, path).await?)
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
         Ok(ToolOutput {
@@ -96,7 +109,7 @@ impl Tool for ListDir {
     }
     async fn run(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        let mut entries = tokio::fs::read_dir(safe_path(&ctx.workspace_root, path)?)
+        let mut entries = tokio::fs::read_dir(safe_path(&ctx.workspace_root, path).await?)
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
         let mut names = Vec::new();
@@ -163,5 +176,52 @@ impl Tool for RunCommand {
                 json!({"success":output.status.success(),"exit_code":output.status.code()}),
             ),
         })
+    }
+}
+
+#[cfg(all(test, feature = "fs", unix))]
+mod tests {
+    use super::*;
+    use agent_core::Tool;
+    use tokio_util::sync::CancellationToken;
+
+    fn context_for(workspace: &Path) -> ToolContext {
+        ToolContext {
+            session_id: uuid::Uuid::new_v4(),
+            workspace_root: workspace.to_path_buf(),
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_parent_dir_and_absolute_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ctx = context_for(workspace.path());
+        for path in ["../secret.txt", "/etc/hosts"] {
+            let result = ReadFile.run(json!({ "path": path }), &ctx).await;
+            assert!(
+                matches!(result, Err(ToolError::InvalidArguments(_))),
+                "{path} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_symlinks_that_leave_the_workspace() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("ok.txt"), "ok").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            workspace.path().join("link.txt"),
+        )
+        .unwrap();
+        let ctx = context_for(workspace.path());
+
+        let escape = ReadFile.run(json!({"path": "link.txt"}), &ctx).await;
+        assert!(matches!(escape, Err(ToolError::InvalidArguments(_))));
+        let allowed = ReadFile.run(json!({"path": "ok.txt"}), &ctx).await.unwrap();
+        assert_eq!(allowed.text, "ok");
     }
 }

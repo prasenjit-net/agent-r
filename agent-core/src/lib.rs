@@ -440,10 +440,6 @@ pub struct AgentResult {
 pub enum AgentError {
     #[error("duplicate tool name: {0}")]
     DuplicateTool(String),
-    #[error("tool not found: {0}")]
-    UnknownTool(String),
-    #[error("tool {0} is denied by policy")]
-    Denied(String),
     #[error("tool call budget exceeded")]
     ToolBudgetExceeded,
     #[error("turn budget exceeded")]
@@ -559,17 +555,7 @@ impl Agent {
         cancellation: CancellationToken,
     ) -> Result<AgentResult, AgentError> {
         let session = SessionState::new(self.profile.system_prompt(), task.into());
-        let future = self.run_session_inner(session, cancellation);
-        match tokio::time::timeout(self.config.timeout, future).await {
-            Ok(result) => result,
-            Err(_) => {
-                self.emit(AgentEvent::Failed {
-                    error: "agent timed out".into(),
-                })
-                .await;
-                Err(AgentError::TimedOut)
-            }
-        }
+        self.run_bounded(session, cancellation).await
     }
     /// Add a user task to a persisted session and continue the same conversation.
     pub async fn continue_session(
@@ -590,11 +576,47 @@ impl Agent {
         session.messages.push(Message::User {
             content: vec![ContentBlock::Text(session.current_task.clone())],
         });
-        self.run_session_inner(session, cancellation).await
+        self.run_bounded(session, cancellation).await
+    }
+    /// Applies the run timeout and persists the session whether or not the run
+    /// succeeded, so accumulated work survives failures and can be resumed.
+    async fn run_bounded(
+        &self,
+        mut session: SessionState,
+        cancellation: CancellationToken,
+    ) -> Result<AgentResult, AgentError> {
+        let result = match tokio::time::timeout(
+            self.config.timeout,
+            self.run_session_inner(&mut session, cancellation),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(AgentError::TimedOut),
+        };
+        if let Err(error) = &result {
+            self.emit(AgentEvent::Failed {
+                error: error.to_string(),
+            });
+            // An interrupted turn may leave tool calls without results, which
+            // strict providers reject on resume.
+            backfill_unanswered_tool_calls(&mut session);
+        }
+        if let Some(store) = &self.session_store {
+            match store.save(&session).await {
+                Ok(()) => self.emit(AgentEvent::SessionSaved {
+                    session_id: session.id,
+                }),
+                // A failed save must not mask an error the run already hit.
+                Err(error) if result.is_ok() => return Err(error.into()),
+                Err(_) => {}
+            }
+        }
+        result
     }
     async fn run_session_inner(
         &self,
-        mut session: SessionState,
+        session: &mut SessionState,
         cancellation: CancellationToken,
     ) -> Result<AgentResult, AgentError> {
         let mut usage = TokenUsage::default();
@@ -603,8 +625,8 @@ impl Agent {
             if cancellation.is_cancelled() {
                 return Err(AgentError::Cancelled);
             }
-            self.emit(AgentEvent::TurnStarted { turn }).await;
-            let context = self.context_for(&mut session).await;
+            self.emit(AgentEvent::TurnStarted { turn });
+            let context = self.context_for(session);
             let stream = self
                 .provider
                 .stream(CompletionRequest {
@@ -614,7 +636,7 @@ impl Agent {
                 .await?;
             for event in stream.events {
                 let ProviderStreamEvent::TextDelta(text) = event;
-                self.emit(AgentEvent::TextDelta(text)).await;
+                self.emit(AgentEvent::TextDelta(text));
             }
             let response = stream.response;
             usage.input_tokens += response.usage.input_tokens;
@@ -655,23 +677,14 @@ impl Agent {
                     final_answer,
                     messages: session.messages.clone(),
                     usage,
-                    session,
+                    session: session.clone(),
                 };
-                if let Some(store) = &self.session_store {
-                    store.save(&result.session).await?;
-                    self.emit(AgentEvent::SessionSaved {
-                        session_id: result.session.id,
-                    })
-                    .await;
-                }
                 self.emit(AgentEvent::TurnCompleted {
                     usage: result.usage.clone(),
-                })
-                .await;
+                });
                 self.emit(AgentEvent::Completed {
                     result: result.clone(),
-                })
-                .await;
+                });
                 return Ok(result);
             }
             for mut call in tool_calls {
@@ -679,10 +692,19 @@ impl Agent {
                 if calls > self.config.max_tool_calls {
                     return Err(AgentError::ToolBudgetExceeded);
                 }
-                self.emit(AgentEvent::ToolCallRequested { call: call.clone() })
-                    .await;
+                self.emit(AgentEvent::ToolCallRequested { call: call.clone() });
                 match self.policy.permission(&call.name) {
-                    ToolPermission::Deny => return Err(AgentError::Denied(call.name)),
+                    // Recoverable problems (denied, unknown, invalid, failed
+                    // calls) are fed back to the model instead of ending the
+                    // run, so it can adjust course.
+                    ToolPermission::Deny => {
+                        let output = ToolOutput {
+                            text: format!("Denied: tool '{}' is not permitted by policy", call.name),
+                            payload: None,
+                        };
+                        self.push_tool_result(session, call.id, output);
+                        continue;
+                    }
                     ToolPermission::RequireApproval => match self.approval.review(&call).await {
                         Approval::Allow => {}
                         Approval::Modify { arguments } => call.arguments = arguments,
@@ -691,43 +713,82 @@ impl Agent {
                                 text: format!("Denied: {reason}"),
                                 payload: None,
                             };
-                            session.messages.push(Message::ToolResult {
-                                call_id: call.id,
-                                output,
-                            });
+                            self.push_tool_result(session, call.id, output);
                             continue;
                         }
                     },
                     ToolPermission::Allow => {}
                 }
-                let tool = self
-                    .registry
-                    .get(&call.name)
-                    .ok_or_else(|| AgentError::UnknownTool(call.name.clone()))?;
+                let Some(tool) = self.registry.get(&call.name) else {
+                    let output = ToolOutput {
+                        text: format!("Error: unknown tool '{}'", call.name),
+                        payload: None,
+                    };
+                    self.push_tool_result(session, call.id, output);
+                    continue;
+                };
+                if let Err(reason) = validate_arguments(&tool.parameters(), &call.arguments) {
+                    let output = ToolOutput {
+                        text: format!("Invalid arguments: {reason}"),
+                        payload: None,
+                    };
+                    self.push_tool_result(session, call.id, output);
+                    continue;
+                }
                 let context = ToolContext {
                     session_id: session.id,
                     workspace_root: self.config.workspace_root.clone(),
                     cancellation: cancellation.clone(),
                 };
-                let output = tool.run(call.arguments, &context).await?;
-                self.emit(AgentEvent::ToolCallFinished {
-                    call_id: call.id.clone(),
-                    output: output.clone(),
-                })
-                .await;
-                session.messages.push(Message::ToolResult {
-                    call_id: call.id,
-                    output,
-                });
+                let output = match tool.run(call.arguments, &context).await {
+                    Ok(output) => output,
+                    Err(ToolError::Cancelled) => return Err(AgentError::Cancelled),
+                    Err(error) => ToolOutput {
+                        text: format!("Error: {error}"),
+                        payload: None,
+                    },
+                };
+                self.push_tool_result(session, call.id, output);
             }
             self.emit(AgentEvent::TurnCompleted {
                 usage: usage.clone(),
-            })
-            .await;
+            });
         }
         Err(AgentError::TurnBudgetExceeded)
     }
-    async fn context_for(&self, session: &mut SessionState) -> Vec<Message> {
+    /// Assembles the model context, evicting and summarizing older messages
+    /// when the estimated size exceeds the budget. Eviction is persisted to the
+    /// session so already-summarized messages are never summarized twice.
+    fn context_for(&self, session: &mut SessionState) -> Vec<Message> {
+        let budget = &self.config.context_budget;
+        let mut evicted_total = 0;
+        loop {
+            let mut evicted = Vec::new();
+            while estimated_context_tokens(session) > budget.max_estimated_tokens {
+                let Some(index) = evictable_index(&session.messages) else {
+                    break;
+                };
+                evicted.push(session.messages.remove(index));
+            }
+            if evicted.is_empty() {
+                break;
+            }
+            evicted_total += evicted.len();
+            // Below the trigger the evicted content is small enough to drop.
+            if estimated_tokens(&evicted) >= budget.summary_trigger_tokens {
+                session.memory.summary = Some(compact_messages(
+                    session.memory.summary.as_deref(),
+                    &evicted,
+                ));
+                // The grown summary may put the context back over budget, so
+                // loop and evict further if candidates remain.
+            }
+        }
+        if evicted_total > 0 {
+            self.emit(AgentEvent::ContextCompacted {
+                evicted_messages: evicted_total,
+            });
+        }
         let mut context = session.messages.clone();
         if let Some(summary) = &session.memory.summary {
             context.insert(
@@ -737,66 +798,126 @@ impl Agent {
                 },
             );
         }
-        let mut evicted = Vec::new();
-        while estimated_tokens(&context) > self.config.context_budget.max_estimated_tokens {
-            let current_user = context
-                .iter()
-                .rposition(|message| matches!(message, Message::User { .. }));
-            let candidate = context
-                .iter()
-                .position(|message| matches!(message, Message::ToolResult { .. }))
-                .or_else(|| {
-                    context.iter().enumerate().find_map(|(index, message)| {
-                        (index != 0
-                            && Some(index) != current_user
-                            && !matches!(message, Message::Summary { .. }))
-                        .then_some(index)
-                    })
-                });
-            let Some(index) = candidate else { break };
-            evicted.push(context.remove(index));
-        }
-        if !evicted.is_empty() {
-            let evicted_tokens = estimated_tokens(&evicted);
-            if evicted_tokens >= self.config.context_budget.summary_trigger_tokens {
-                session.memory.summary = Some(compact_messages(
-                    session.memory.summary.as_deref(),
-                    &evicted,
-                ));
-                context.insert(
-                    1,
-                    Message::Summary {
-                        content: session.memory.summary.clone().unwrap_or_default(),
-                    },
-                );
-                while estimated_tokens(&context) > self.config.context_budget.max_estimated_tokens {
-                    let protected_user = context
-                        .iter()
-                        .rposition(|message| matches!(message, Message::User { .. }));
-                    let candidate = context
-                        .iter()
-                        .position(|message| matches!(message, Message::ToolResult { .. }))
-                        .or_else(|| {
-                            context.iter().enumerate().find_map(|(index, message)| {
-                                (index != 0
-                                    && Some(index) != protected_user
-                                    && !matches!(message, Message::Summary { .. }))
-                                .then_some(index)
-                            })
-                        });
-                    let Some(index) = candidate else { break };
-                    context.remove(index);
-                }
-            }
-            self.emit(AgentEvent::ContextCompacted {
-                evicted_messages: evicted.len(),
-            })
-            .await;
-        }
         context
     }
-    async fn emit(&self, event: AgentEvent) {
-        let _ = self.events.send(event).await;
+    /// Events are advisory: if the receiver is gone or its buffer is full the
+    /// event is dropped rather than stalling the run.
+    fn emit(&self, event: AgentEvent) {
+        let _ = self.events.try_send(event);
+    }
+    fn push_tool_result(&self, session: &mut SessionState, call_id: ToolCallId, output: ToolOutput) {
+        self.emit(AgentEvent::ToolCallFinished {
+            call_id: call_id.clone(),
+            output: output.clone(),
+        });
+        session.messages.push(Message::ToolResult { call_id, output });
+    }
+}
+
+/// The system prompt (index 0) and the current task's user message are never
+/// evicted; tool results go first, then the oldest remaining message.
+fn evictable_index(messages: &[Message]) -> Option<usize> {
+    let current_user = messages
+        .iter()
+        .rposition(|message| matches!(message, Message::User { .. }));
+    messages
+        .iter()
+        .position(|message| matches!(message, Message::ToolResult { .. }))
+        .or_else(|| {
+            messages.iter().enumerate().find_map(|(index, _)| {
+                (index != 0 && Some(index) != current_user).then_some(index)
+            })
+        })
+}
+
+fn estimated_context_tokens(session: &SessionState) -> usize {
+    let summary = session
+        .memory
+        .summary
+        .as_ref()
+        .map_or(0, |summary| summary.len().div_ceil(4));
+    estimated_tokens(&session.messages) + summary
+}
+
+/// Conservative structural check of arguments against the tool's JSON Schema.
+/// Only the subset the runtime understands is enforced (object type, required
+/// keys, primitive property types); unknown schema constructs are ignored so a
+/// valid call is never wrongly rejected.
+fn validate_arguments(schema: &Value, args: &Value) -> Result<(), String> {
+    let Some(schema) = schema.as_object() else {
+        return Ok(());
+    };
+    if schema.get("type").and_then(Value::as_str) != Some("object") {
+        return Ok(());
+    }
+    let Some(args) = args.as_object() else {
+        return Err("arguments must be a JSON object".into());
+    };
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        for key in required.iter().filter_map(Value::as_str) {
+            if !args.contains_key(key) {
+                return Err(format!("missing required argument: {key}"));
+            }
+        }
+    }
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        for (key, property) in properties {
+            let expected = property.get("type").and_then(Value::as_str);
+            if let (Some(value), Some(expected)) = (args.get(key), expected) {
+                if !json_type_matches(value, expected) {
+                    return Err(format!("argument '{key}' must be of type {expected}"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn json_type_matches(value: &Value, expected: &str) -> bool {
+    match expected {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        _ => true,
+    }
+}
+
+/// Adds placeholder results for assistant tool calls that never received one,
+/// so a session interrupted mid-turn stays resumable.
+fn backfill_unanswered_tool_calls(session: &mut SessionState) {
+    let answered: HashSet<&ToolCallId> = session
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::ToolResult { call_id, .. } => Some(call_id),
+            _ => None,
+        })
+        .collect();
+    let unanswered: Vec<ToolCallId> = session
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::Assistant { content } => Some(content),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|block| match block {
+            ContentBlock::ToolCall { id, .. } if !answered.contains(id) => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    for call_id in unanswered {
+        session.messages.push(Message::ToolResult {
+            call_id,
+            output: ToolOutput {
+                text: "Interrupted before this tool call finished.".into(),
+                payload: None,
+            },
+        });
     }
 }
 
@@ -842,7 +963,11 @@ mod tests {
             "echoes"
         }
         fn parameters(&self) -> Value {
-            Value::Null
+            serde_json::json!({
+                "type": "object",
+                "required": ["value"],
+                "properties": {"value": {"type": "string"}}
+            })
         }
         async fn run(&self, args: Value, _: &ToolContext) -> Result<ToolOutput, ToolError> {
             Ok(ToolOutput {
@@ -945,7 +1070,7 @@ mod tests {
             content: vec![ContentBlock::Text("current task".into())],
         });
 
-        let context = agent.context_for(&mut session).await;
+        let context = agent.context_for(&mut session);
         assert!(matches!(context.first(), Some(Message::System { .. })));
         assert!(context.iter().any(
             |message| matches!(message, Message::User { content } if content == &vec![ContentBlock::Text("current task".into())])
@@ -953,5 +1078,159 @@ mod tests {
             "context was {context:?}"
         );
         assert!(session.memory.summary.as_deref().unwrap().contains("old"));
+    }
+
+    #[tokio::test]
+    async fn compaction_never_resummarizes_evicted_messages() {
+        let config = AgentConfig {
+            context_budget: ContextBudget {
+                max_estimated_tokens: 40,
+                summary_trigger_tokens: 1,
+            },
+            ..Default::default()
+        };
+        let (agent, _) = AgentBuilder::new()
+            .config(config)
+            .provider(ScriptedProvider {
+                responses: std::sync::Mutex::new(vec![]),
+            })
+            .build()
+            .unwrap();
+        let mut session = SessionState::new("system".into(), "task".into());
+        session.messages.push(Message::ToolResult {
+            call_id: "old".into(),
+            output: ToolOutput {
+                text: "x".repeat(500),
+                payload: None,
+            },
+        });
+
+        agent.context_for(&mut session);
+        let summary = session.memory.summary.clone().unwrap();
+        let remaining = session.messages.len();
+        assert!(!session
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::ToolResult { .. })));
+
+        // A second assembly finds nothing new to evict: the summary must not
+        // grow and no message may be summarized twice.
+        agent.context_for(&mut session);
+        assert_eq!(session.memory.summary.as_deref(), Some(summary.as_str()));
+        assert_eq!(session.messages.len(), remaining);
+    }
+
+    #[tokio::test]
+    async fn denied_and_unknown_tools_feed_back_instead_of_aborting() {
+        let provider = ScriptedProvider {
+            responses: std::sync::Mutex::new(vec![
+                CompletionResponse {
+                    content: vec![
+                        ContentBlock::ToolCall {
+                            id: "1".into(),
+                            name: "blocked".into(),
+                            arguments: serde_json::json!({}),
+                        },
+                        ContentBlock::ToolCall {
+                            id: "2".into(),
+                            name: "missing".into(),
+                            arguments: serde_json::json!({}),
+                        },
+                    ],
+                    usage: TokenUsage::default(),
+                },
+                CompletionResponse {
+                    content: vec![ContentBlock::Text("recovered".into())],
+                    usage: TokenUsage::default(),
+                },
+            ]),
+        };
+        let mut policy = ToolPolicy::default();
+        policy.denylist.insert("blocked".into());
+        policy
+            .per_tool
+            .insert("missing".into(), ToolPermission::Allow);
+        let (agent, _) = AgentBuilder::new()
+            .provider(provider)
+            .tool_policy(policy)
+            .build()
+            .unwrap();
+        let result = agent.run("go").await.unwrap();
+        assert_eq!(result.final_answer, "recovered");
+        assert!(result.messages.iter().any(|message| matches!(
+            message,
+            Message::ToolResult { call_id, output } if call_id == "1" && output.text.contains("Denied")
+        )));
+        assert!(result.messages.iter().any(|message| matches!(
+            message,
+            Message::ToolResult { call_id, output } if call_id == "2" && output.text.contains("unknown tool")
+        )));
+    }
+
+    #[tokio::test]
+    async fn invalid_arguments_are_rejected_before_the_tool_runs() {
+        let provider = ScriptedProvider {
+            responses: std::sync::Mutex::new(vec![
+                CompletionResponse {
+                    content: vec![ContentBlock::ToolCall {
+                        id: "1".into(),
+                        name: "echo".into(),
+                        arguments: serde_json::json!({"value": 42}),
+                    }],
+                    usage: TokenUsage::default(),
+                },
+                CompletionResponse {
+                    content: vec![ContentBlock::Text("done".into())],
+                    usage: TokenUsage::default(),
+                },
+            ]),
+        };
+        let registry = ToolRegistry::new()
+            .register(Echo, ToolSource::Custom)
+            .unwrap();
+        let mut policy = ToolPolicy::default();
+        policy.per_tool.insert("echo".into(), ToolPermission::Allow);
+        let (agent, _) = AgentBuilder::new()
+            .provider(provider)
+            .tools(registry)
+            .tool_policy(policy)
+            .build()
+            .unwrap();
+        let result = agent.run("go").await.unwrap();
+        assert_eq!(result.final_answer, "done");
+        assert!(result.messages.iter().any(|message| matches!(
+            message,
+            Message::ToolResult { output, .. }
+                if output.text.contains("Invalid arguments") && output.text.contains("value")
+        )));
+    }
+
+    struct SlowProvider;
+    #[async_trait]
+    impl Provider for SlowProvider {
+        async fn complete(
+            &self,
+            _: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            unreachable!("the run must time out first")
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_out_runs_still_persist_the_session() {
+        let store = InMemorySessionStore::default();
+        let (agent, _) = AgentBuilder::new()
+            .config(AgentConfig {
+                timeout: Duration::from_millis(50),
+                ..Default::default()
+            })
+            .provider(SlowProvider)
+            .session_store(store.clone())
+            .build()
+            .unwrap();
+        let error = agent.run("task").await.unwrap_err();
+        assert!(matches!(error, AgentError::TimedOut));
+        assert_eq!(store.sessions.lock().unwrap().len(), 1);
     }
 }

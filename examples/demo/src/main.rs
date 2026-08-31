@@ -50,6 +50,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let result = agent.run("Inspect this workspace").await?;
     println!("Final answer: {}", result.final_answer);
+    // Dropping the agent closes the event channel so the printer can finish.
+    drop(agent);
     printer.await?;
     Ok(())
 }
