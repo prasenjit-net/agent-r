@@ -1,8 +1,10 @@
 //! Provider implementations. `MockProvider` enables deterministic offline tests.
 use agent_core::{
-    CompletionRequest, CompletionResponse, Provider, ProviderError, ProviderMetadata,
+    CompletionRequest, CompletionResponse, ContentBlock, Message, Provider, ProviderError,
+    ProviderMetadata, TokenUsage,
 };
 use async_trait::async_trait;
+use serde_json::{json, Value};
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
@@ -11,6 +13,156 @@ use std::{
 
 pub struct MockProvider {
     responses: Mutex<VecDeque<CompletionResponse>>,
+}
+
+/// OpenAI Chat Completions-compatible provider. This also supports compatible
+/// gateways and local servers by configuring a different base URL.
+pub struct OpenAiCompatibleProvider {
+    client: reqwest::Client,
+    base_url: String,
+    api_key: String,
+    model: String,
+}
+impl OpenAiCompatibleProvider {
+    pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+        Self::with_base_url("https://api.openai.com/v1", api_key, model)
+    }
+    pub fn with_base_url(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            base_url: base_url.into().trim_end_matches('/').into(),
+            api_key: api_key.into(),
+            model: model.into(),
+        }
+    }
+}
+#[async_trait]
+impl Provider for OpenAiCompatibleProvider {
+    fn metadata(&self) -> ProviderMetadata {
+        ProviderMetadata {
+            model: self.model.clone(),
+            context_window_tokens: None,
+            supports_tools: true,
+            supports_streaming: false,
+        }
+    }
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse, ProviderError> {
+        let messages: Vec<Value> = request
+            .messages
+            .iter()
+            .map(openai_message)
+            .collect::<Result<_, _>>()?;
+        let tools: Vec<Value> = request.tools.iter().map(|tool| json!({"type":"function","function":{"name":tool.name,"description":tool.description,"parameters":tool.parameters}})).collect();
+        let body =
+            json!({"model":self.model,"messages":messages,"tools":tools,"tool_choice":"auto"});
+        let response = self
+            .client
+            .post(format!("{}/chat/completions", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError(e.to_string()))?;
+        let status = response.status();
+        let value: Value = response
+            .json()
+            .await
+            .map_err(|e| ProviderError(e.to_string()))?;
+        if !status.is_success() {
+            return Err(ProviderError(value.to_string()));
+        }
+        parse_openai_response(value)
+    }
+}
+
+fn openai_message(message: &Message) -> Result<Value, ProviderError> {
+    match message {
+        Message::System { content } | Message::Summary { content } => {
+            Ok(json!({"role":"system","content":content}))
+        }
+        Message::User { content } => Ok(json!({"role":"user","content":text_blocks(content)})),
+        Message::Assistant { content } => {
+            let text = text_blocks(content);
+            let calls: Vec<Value> = content.iter().filter_map(|block| if let ContentBlock::ToolCall { id,name,arguments } = block { Some(json!({"id":id,"type":"function","function":{"name":name,"arguments":arguments.to_string()}})) } else { None }).collect();
+            let mut value = json!({"role":"assistant","content":text});
+            if !calls.is_empty() {
+                value["tool_calls"] = json!(calls);
+            }
+            Ok(value)
+        }
+        Message::ToolResult { call_id, output } => {
+            Ok(json!({"role":"tool","tool_call_id":call_id,"content":output.text}))
+        }
+    }
+}
+fn text_blocks(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|block| {
+            if let ContentBlock::Text(text) = block {
+                Some(text.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+fn parse_openai_response(value: Value) -> Result<CompletionResponse, ProviderError> {
+    let message = value
+        .pointer("/choices/0/message")
+        .ok_or_else(|| ProviderError("response has no choice".into()))?;
+    let mut content = message
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(|s| vec![ContentBlock::Text(s.into())])
+        .unwrap_or_default();
+    if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+        for call in calls {
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ProviderError("tool call missing id".into()))?;
+            let function = call
+                .get("function")
+                .ok_or_else(|| ProviderError("tool call missing function".into()))?;
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ProviderError("tool call missing name".into()))?;
+            let arguments = serde_json::from_str(
+                function
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}"),
+            )
+            .map_err(|e| ProviderError(format!("invalid tool arguments: {e}")))?;
+            content.push(ContentBlock::ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments,
+            });
+        }
+    }
+    let usage = TokenUsage {
+        input_tokens: value
+            .pointer("/usage/prompt_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        output_tokens: value
+            .pointer("/usage/completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    };
+    Ok(CompletionResponse { content, usage })
 }
 impl MockProvider {
     pub fn scripted(responses: impl IntoIterator<Item = CompletionResponse>) -> Self {
