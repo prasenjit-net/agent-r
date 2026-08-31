@@ -71,24 +71,24 @@ pub struct AgentProfile {
     pub role: String,
     pub instructions: Vec<String>,
     pub goals: Vec<String>,
-    pub tool_policy: ToolPolicy,
 }
 ```
 
-Note: `instructions` and `goals` are advisory prompt text. Enforceable restrictions (allowlists, denylists, approval requirements, budgets) live in `ToolPolicy` and `AgentConfig`, never in prompt strings. The two must not be conflated: prompt text can be ignored by a model; policy cannot.
+Note: `instructions` and `goals` are advisory prompt text. Enforceable restrictions (allowlists, denylists, approval requirements, budgets) live in `ToolPolicy` and `AgentConfig` — both supplied to `AgentBuilder` alongside the profile — never in prompt strings. The two must not be conflated: prompt text can be ignored by a model; policy cannot.
 
 ### Runtime config
 
 ```rust
 pub struct AgentConfig {
-    pub provider: ProviderConfig,
     pub max_turns: usize,
     pub max_tool_calls: usize,
     pub timeout: Duration,
-    pub memory_policy: MemoryPolicy,
+    pub workspace_root: PathBuf,
     pub context_budget: ContextBudget,
 }
 ```
+
+The provider, tool policy, approval hook, and session store are configured on `AgentBuilder`, not inside `AgentConfig`, so each is an independently swappable component.
 
 ### Capability bundles
 
@@ -415,6 +415,14 @@ A coding agent may allow shell execution; a support agent may not. A business wo
 ## 15. Public API
 
 ```rust
+let registry = ToolRegistry::new()
+    .register(ListDir, ToolSource::Builtin)?
+    .register(ReadFile, ToolSource::Builtin)?
+    .register(MyCustomTool, ToolSource::Custom)?;
+let mut policy = ToolPolicy::default();
+policy.per_tool.insert("filesystem.list_dir".into(), ToolPermission::Allow);
+policy.per_tool.insert("filesystem.read_file".into(), ToolPermission::Allow);
+
 let (agent, mut events) = AgentBuilder::new()
     .profile(AgentProfile {
         name: "ops-assistant".into(),
@@ -425,15 +433,14 @@ let (agent, mut events) = AgentBuilder::new()
         ],
         ..Default::default()
     })
-    .provider(ProviderConfig::anthropic("claude-sonnet-5"))
-    .fallback_provider(ProviderConfig::openai("gpt-4.1"))
-    .tools(
-        ToolRegistry::new()
-            .enable(CapabilityBundle::Filesystem)
-            .enable(CapabilityBundle::Ops)
-            .register_custom(MyCustomTool)?,
-    )
+    .provider(FallbackProvider::new(vec![
+        Arc::new(OpenAiCompatibleProvider::new(api_key, "gpt-4.1")),
+        Arc::new(OllamaProvider::new("llama3")),
+    ])?)
+    .tools(registry)
+    .tool_policy(policy)
     .approval_hook(MyApprovalHook)
+    .session_store(InMemorySessionStore::default())
     .build()?;
 
 // Optional: observe progress.
@@ -447,7 +454,7 @@ let result = agent.run("Check service health and summarize the incident").await?
 println!("{}", result.final_answer);
 ```
 
-Same runtime, different role, different tool set. A coding agent host would enable `Coding` instead of `Ops`, point the environment at a repo, and allow shell execution in its `ToolPolicy`.
+Same runtime, different role, different tool set. A coding agent host would register the coding pack instead, point `workspace_root` at a repo, and allow shell execution in its `ToolPolicy`. The capability-bundle presets from section 3 remain a planned convenience layer over this registry API — typed `enable(CapabilityBundle::Ops)`-style constructors that expand to the registrations shown above.
 
 ---
 
